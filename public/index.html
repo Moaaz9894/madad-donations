@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>عدّاد التبرعات</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="page" dir="rtl" lang="ar">
+<header class="hero">
+  <img class="logo" alt="شعار لجنة تدريب القوافل الخارجية" src="logo.png">
+  <span class="range" id="range" hidden></span>
+  <h1 class="title">حملة الرمق الأخير لـ متدربين مَدد</h1>
+  <p class="sub">عدّاد التبرعات المباشر</p>
+  <span class="bar" aria-hidden="true"></span>
+</header>
+
+<main id="pub" class="stack"><p class="empty">جارٍ التحميل…</p></main>
+</div>
+
+<script type="module">
+import { app } from './firebase-config.js';
+import { getFirestore, doc, collection, onSnapshot, query, orderBy, limit }
+  from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+const db = getFirestore(app);
+let state = null;   // وثيقة campaign/main
+let log = [];       // آخر التبرعات
+
+const $ = (s) => document.querySelector(s);
+const nf = (n) => Number(n).toLocaleString('en-US');
+const LOC = 'ar-EG-u-nu-latn';
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pct = (g) => g.target > 0 ? Math.min(100, Math.floor(g.raised / g.target * 100)) : 0;
+const remaining = (g) => Math.max(0, g.target - g.raised);
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function dayInfo() {
+  const s = new Date(state.start + 'T00:00:00');
+  const e = new Date(state.end + 'T00:00:00');
+  const t = new Date(); t.setHours(0, 0, 0, 0);
+  const total = Math.round((e - s) / 864e5) + 1;
+  let left = Math.round((e - t) / 864e5) + 1;
+  left = Math.max(0, Math.min(total, left));
+  return { s, e, total, left };
+}
+function rangeText() {
+  const d = dayInfo();
+  const M = (x) => x.toLocaleDateString(LOC, { month: 'long' });
+  if (d.s.getMonth() === d.e.getMonth()) return d.s.getDate() + ' – ' + d.e.getDate() + ' ' + M(d.e) + ' ' + d.e.getFullYear();
+  return d.s.getDate() + ' ' + M(d.s) + ' – ' + d.e.getDate() + ' ' + M(d.e) + ' ' + d.e.getFullYear();
+}
+
+function segs(g) {
+  const n = Math.min(40, Math.max(4, Math.round(g.target / 1000)));
+  const unit = g.target / n;
+  let h = '';
+  for (let i = 0; i < n; i++) {
+    const f = Math.max(0, Math.min(1, (g.raised - i * unit) / unit));
+    h += '<i style="--f:' + f.toFixed(3) + '"></i>';
+  }
+  return { html: h, cols: n > 24 ? Math.ceil(n / 2) : n, unit: Math.round(unit) };
+}
+
+function goalCard(key) {
+  const g = state.goals[key], sg = segs(g), u = esc(state.unit);
+  const done = g.raised >= g.target;
+  const foot = done
+    ? '<span class="bonus ok">تحقق الهدف</span><span class="goldtxt">جزاكم الله خيرًا</span>'
+    : '<span class="bonus">المتبقي</span><span class="goldtxt">' + nf(remaining(g)) + ' ' + u + '</span>';
+  return '<section class="card ' + key + '" aria-label="' + esc(g.name) + '">' +
+    '<div class="card-head"><h2>' + esc(g.name) + '</h2><span class="pill">' + pct(g) + '%</span></div>' +
+    '<p class="amount"><strong>' + nf(g.raised) + '</strong><span>من ' + nf(g.target) + ' ' + u + '</span></p>' +
+    '<div class="seg" role="img" aria-label="تم جمع ' + nf(g.raised) + ' من ' + nf(g.target) + ' ' + u + '" style="--cols:' + sg.cols + '">' + sg.html + '</div>' +
+    '<p class="unit">كل مربع ' + nf(sg.unit) + ' ' + u + '</p>' +
+    '<div class="cardfoot">' + foot + '</div></section>';
+}
+
+const endMs = () => new Date(state.end + 'T23:59:59').getTime() + 999;
+const startMs = () => new Date(state.start + 'T00:00:00').getTime();
+let reduceMotion = false;
+try { reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+
+function clockBlock() {
+  const d = dayInfo();
+  let cells = '';
+  const elapsed = d.total - d.left;
+  for (let i = 0; i < d.total; i++) {
+    const dt = new Date(d.s); dt.setDate(d.s.getDate() + i);
+    const cls = i < elapsed ? 'past' : (i === elapsed && d.left > 0 ? 'now' : '');
+    cells += '<div class="day ' + cls + '"><b>' + dt.getDate() + '</b>' + dt.toLocaleDateString(LOC, { weekday: 'short' }) + '</div>';
+  }
+  const days = d.total <= 10 ? '<div class="days" style="--n:' + d.total + '">' + cells + '</div>' : '';
+  const units = [['d', 'يوم'], ['h', 'ساعة'], ['m', 'دقيقة'], ['s', 'ثانية']];
+  const count = '<div class="count" role="timer" aria-label="الوقت المتبقي على نهاية الحملة">' + units.map((u) =>
+    '<div class="unitbox"><div class="dial" id="dial_' + u[0] + '"><b id="n_' + u[0] + '">00</b></div><span>' + u[1] + '</span></div>').join('') + '</div>';
+  const u = esc(state.unit);
+  const rem = remaining(state.goals.water) + remaining(state.goals.zakat);
+  let foot = '';
+  if (rem === 0) {
+    foot = '<div class="cardfoot"><span class="bonus ok">اكتمل</span><span class="goldtxt">تحقق الهدفان. جزاكم الله خيرًا</span></div>';
+  } else if (d.left > 0) {
+    foot = '<div class="cardfoot"><span class="bonus">المطلوب يوميًا</span><span class="goldtxt">نحو ' + nf(Math.ceil(rem / d.left)) + ' ' + u + ' · المتبقي ' + nf(rem) + '</span></div>';
+  }
+  const endLabel = d.e.toLocaleDateString(LOC, { weekday: 'long', day: 'numeric', month: 'long' });
+  return '<section class="card time" aria-label="الوقت المتبقي"><div class="card-head"><h2>الوقت المتبقي</h2><span class="pill" id="pillTime">تنتهي ' + endLabel + '</span></div>' + count + days + foot + '</section>';
+}
+
+let tickTimer = null;
+function tick() {
+  if (!state) return;
+  const end = endMs();
+  const diff = Math.max(0, end - Date.now());
+  const total = Math.floor(diff / 1000);
+  const vals = { d: Math.floor(total / 86400), h: Math.floor(total % 86400 / 3600), m: Math.floor(total % 3600 / 60), s: total % 60 };
+  const span = Math.max(1, end - startMs());
+  const ms = reduceMotion ? total * 1000 : diff;
+  const prog = { d: Math.min(1, diff / span), h: (ms % 86400000) / 86400000, m: (ms % 3600000) / 3600000, s: (ms % 60000) / 60000 };
+  ['d', 'h', 'm', 's'].forEach((k) => {
+    const n = $('#n_' + k), dial = $('#dial_' + k);
+    if (!n || !dial) return;
+    const t = pad2(vals[k]);
+    if (n.textContent !== t) n.textContent = t;
+    dial.style.setProperty('--p', prog[k].toFixed(4));
+  });
+  if (diff === 0) {
+    const pill = $('#pillTime');
+    if (pill) pill.textContent = 'انتهت الحملة';
+    clearInterval(tickTimer);
+  }
+}
+function startClock() {
+  tick();
+  clearInterval(tickTimer);
+  tickTimer = setInterval(tick, reduceMotion ? 1000 : 100);
+}
+
+function logBlock() {
+  let body;
+  if (!log.length) {
+    body = '<p class="empty">لم يُسجَّل أي تبرع بعد. أول تبرع سيظهر هنا.</p>';
+  } else {
+    body = '<ul class="log">' + log.map((r) => {
+      const g = state.goals[r.g] || { name: '' };
+      const dt = r.t && r.t.toDate ? r.t.toDate() : new Date();
+      const when = dt.toLocaleString(LOC, { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+      return '<li class="' + esc(r.g) + '"><span class="dot"></span><div class="body"><div class="row1"><span class="amt">' +
+        nf(r.amt) + ' ' + esc(state.unit) + '</span><span class="tag">' + esc(g.name) + '</span></div>' +
+        '<div class="row2">' + esc(r.who || 'فاعل خير') + ' · ' + when + '</div></div></li>';
+    }).join('') + '</ul>';
+  }
+  return '<section class="card"><div class="card-head"><h2>آخر التبرعات</h2></div>' + body + '</section>';
+}
+
+function howBlock() {
+  if (!state.howTo) return '';
+  return '<section class="card"><div class="card-head"><h2>طريقة التبرع</h2></div><p class="howtxt">' + esc(state.howTo) + '</p></section>';
+}
+
+function render() {
+  if (!state) return;
+  const r = $('#range');
+  r.textContent = rangeText(); r.hidden = false;
+  $('#pub').innerHTML = clockBlock() + goalCard('water') + goalCard('zakat') + howBlock() + logBlock();
+  startClock();
+}
+
+onSnapshot(doc(db, 'campaign', 'main'), (snap) => {
+  if (!snap.exists()) {
+    $('#pub').innerHTML = '<p class="empty">الحملة لم تبدأ بعد.</p>';
+    return;
+  }
+  state = snap.data();
+  render();
+}, () => {
+  $('#pub').innerHTML = '<p class="empty">تعذّر تحميل البيانات. أعد تحميل الصفحة.</p>';
+});
+
+onSnapshot(query(collection(db, 'donations'), orderBy('t', 'desc'), limit(8)), (snap) => {
+  log = snap.docs.map((d) => d.data({ serverTimestamps: 'estimate' }));
+  render();
+}, () => {});
+</script>
+</body>
+</html>

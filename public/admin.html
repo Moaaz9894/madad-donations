@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>لوحة الأدمن - عدّاد التبرعات</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+<style>
+  #page .hero { margin-block: 20px 18px; }
+  #page .logo { width: 110px; }
+  #page .title { font-size: 1.4rem; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .mini { min-height: 34px; padding: 2px 12px; font-size: 13.5px; border-radius: 10px; }
+  .mini.danger { border-color: #F08C8C; color: #F08C8C; }
+  .tot { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .tot strong { font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+  .warn { color: var(--gold); font-size: 13.5px; }
+  details.settings { padding: 6px 18px; }
+</style>
+</head>
+<body>
+<div id="page" dir="rtl" lang="ar">
+<header class="hero">
+  <img class="logo" alt="" src="logo.png">
+  <h1 class="title">لوحة الأدمن</h1>
+  <span class="bar" aria-hidden="true"></span>
+</header>
+
+<div id="app" class="stack"><p class="empty">جارٍ التحميل…</p></div>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+</div>
+
+<script type="module">
+import { app } from './firebase-config.js';
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut }
+  from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import { getFirestore, doc, collection, onSnapshot, query, orderBy, limit, getDocs,
+         writeBatch, updateDoc, setDoc, increment, serverTimestamp }
+  from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+const auth = getAuth(app);
+const db = getFirestore(app);
+const mainRef = doc(db, 'campaign', 'main');
+
+const $ = (s) => document.querySelector(s);
+const nf = (n) => Number(n).toLocaleString('en-US');
+const LOC = 'ar-EG-u-nu-latn';
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const toNum = (s) => Number(String(s).replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[٫٬,\s]/g, ''));
+
+// القيم الابتدائية لما الحملة تتعمل أول مرة (تقدر تعدّلها من الإعدادات بعد كده)
+const DEFAULTS = {
+  unit: 'جنيه',
+  start: '2026-10-03',
+  end: '2026-10-08',
+  howTo: '01221652312',
+  goals: {
+    water: { name: 'وصلة مياه مدد', target: 12000, raised: 0 },
+    zakat: { name: 'زكاة المال', target: 20000, raised: 0 }
+  }
+};
+
+let user = null, state = null, recent = [], unsubs = [], built = false, busy = false;
+
+function toast(t) {
+  const el = $('#toast');
+  el.textContent = t; el.hidden = false;
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => { el.hidden = true; }, 3500);
+}
+function errMsg(e) {
+  const c = e && e.code;
+  if (c === 'permission-denied') return 'هذا الحساب غير مصرّح له بالتعديل.';
+  if (c === 'unavailable') return 'لا يوجد اتصال. أعد المحاولة.';
+  return 'تعذّر الحفظ. أعد المحاولة.';
+}
+async function run(btn, fn, okText) {
+  if (busy) return;
+  busy = true; if (btn) btn.disabled = true;
+  try { await fn(); if (okText) toast(okText); }
+  catch (e) { toast(errMsg(e)); }
+  busy = false; if (btn) btn.disabled = false;
+}
+
+/* ---------- تسجيل الدخول ---------- */
+function renderLogin() {
+  built = false; state = null;
+  $('#app').innerHTML =
+    '<section class="card"><div class="card-head"><h2>تسجيل الدخول</h2></div>' +
+    '<form id="loginForm" class="form">' +
+    '<div class="field"><label for="em">الإيميل</label><input id="em" type="email" autocomplete="username" required></div>' +
+    '<div class="field"><label for="pw">الباسورد</label><input id="pw" type="password" autocomplete="current-password" required></div>' +
+    '<div class="btns"><button class="btn" type="submit">دخول</button></div></form></section>';
+  $('#loginForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button');
+    run(btn, async () => {
+      try { await signInWithEmailAndPassword(auth, $('#em').value.trim(), $('#pw').value); }
+      catch (err) {
+        const bad = ['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found', 'auth/invalid-email'];
+        toast(bad.includes(err.code) ? 'الإيميل أو الباسورد غير صحيح.' : 'تعذّر تسجيل الدخول. أعد المحاولة.');
+      }
+    });
+  });
+}
+
+/* ---------- الهيكل بعد الدخول ---------- */
+function renderShell() {
+  $('#app').innerHTML =
+    '<div class="row"><span class="note">' + esc(user.email) + '</span>' +
+    '<button id="outBtn" class="btn alt mini" type="button">تسجيل خروج</button></div>' +
+
+    '<section class="card" id="setup" hidden><div class="card-head"><h2>إنشاء الحملة</h2></div>' +
+    '<p class="note">لم يتم إنشاء بيانات الحملة بعد. هتتعمل بالقيم الابتدائية وتقدر تعدّلها من الإعدادات.</p>' +
+    '<div class="btns"><button id="createBtn" class="btn" type="button">إنشاء الحملة</button></div></section>' +
+
+    '<div id="main" class="stack" hidden>' +
+      '<section class="card" id="totals"></section>' +
+      '<section class="card"><div class="card-head"><h2>تسجيل تبرع</h2></div><div id="addArea"></div></section>' +
+      '<section class="card"><div class="card-head"><h2>آخر التبرعات</h2></div><div id="recent"></div></section>' +
+      '<section class="card"><div class="btns"><button id="exportBtn" class="btn alt" type="button">تصدير كل التبرعات (CSV)</button></div></section>' +
+      '<details class="card settings"><summary>إعدادات الحملة</summary><div id="setArea"></div></details>' +
+    '</div>';
+
+  $('#outBtn').addEventListener('click', () => signOut(auth));
+  $('#createBtn').addEventListener('click', (e) => run(e.target, () => setDoc(mainRef, DEFAULTS), 'تم إنشاء الحملة'));
+  $('#exportBtn').addEventListener('click', (e) => run(e.target, exportCsv));
+}
+
+function buildForms() {
+  const w = state.goals.water, z = state.goals.zakat, u = esc(state.unit);
+
+  $('#addArea').innerHTML =
+    '<form id="addForm" class="form">' +
+    '<div class="two"><div class="field"><label for="amt">المبلغ (' + u + ')</label><input id="amt" type="text" inputmode="numeric" autocomplete="off" required></div>' +
+    '<div class="field"><label for="goal">المخصص لـ</label><select id="goal"><option value="water">' + esc(w.name) + '</option><option value="zakat">' + esc(z.name) + '</option></select></div></div>' +
+    '<div class="field"><label for="who">اسم المتبرع (اختياري)</label><input id="who" type="text" maxlength="40" placeholder="فاعل خير" autocomplete="off"></div>' +
+    '<p class="note">الاسم يظهر للجميع في قائمة آخر التبرعات. اتركه فارغًا لتظهر «فاعل خير».</p>' +
+    '<div class="btns"><button class="btn" type="submit">سجّل التبرع</button></div></form>';
+
+  $('#addForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const amt = Math.round(toNum($('#amt').value));
+    if (!(amt > 0)) { toast('اكتب مبلغًا صحيحًا'); return; }
+    const g = $('#goal').value;
+    const who = $('#who').value.trim().slice(0, 40);
+    run(e.target.querySelector('button'), async () => {
+      const batch = writeBatch(db);
+      batch.set(doc(collection(db, 'donations')), { g, amt, who, t: serverTimestamp(), by: user.email });
+      batch.update(mainRef, { ['goals.' + g + '.raised']: increment(amt) });
+      await batch.commit();
+      $('#amt').value = ''; $('#who').value = '';
+      $('#amt').focus();
+    }, 'تم تسجيل التبرع');
+  });
+
+  $('#setArea').innerHTML =
+    '<form id="setForm" class="form">' +
+    '<div class="two"><div class="field"><label for="s_wt">هدف ' + esc(w.name) + '</label><input id="s_wt" type="text" inputmode="numeric" value="' + w.target + '"></div>' +
+    '<div class="field"><label for="s_zt">هدف ' + esc(z.name) + '</label><input id="s_zt" type="text" inputmode="numeric" value="' + z.target + '"></div></div>' +
+    '<div class="two"><div class="field"><label for="s_start">أول يوم</label><input id="s_start" type="date" value="' + esc(state.start) + '"></div>' +
+    '<div class="field"><label for="s_end">آخر يوم</label><input id="s_end" type="date" value="' + esc(state.end) + '"></div></div>' +
+    '<div class="field"><label for="s_unit">العملة</label><input id="s_unit" type="text" value="' + u + '"></div>' +
+    '<div class="field"><label for="s_how">طريقة التبرع (تظهر في الصفحة)</label><textarea id="s_how">' + esc(state.howTo || '') + '</textarea></div>' +
+    '<div class="btns"><button class="btn" type="submit">احفظ الإعدادات</button></div></form>' +
+
+    '<form id="fixForm" class="form" style="margin-block-start:18px">' +
+    '<p class="warn">تصحيح المجموع يدويًا (للطوارئ فقط). التبرعات المسجلة بتتضاف تلقائيًا، فاستخدم ده بس لو في خطأ في الرقم.</p>' +
+    '<div class="two"><div class="field"><label for="f_w">مجموع ' + esc(w.name) + '</label><input id="f_w" type="text" inputmode="numeric" value="' + w.raised + '"></div>' +
+    '<div class="field"><label for="f_z">مجموع ' + esc(z.name) + '</label><input id="f_z" type="text" inputmode="numeric" value="' + z.raised + '"></div></div>' +
+    '<div class="btns"><button class="btn alt" type="submit">صحّح المجموع</button></div></form>';
+
+  $('#setForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const wt = toNum($('#s_wt').value), zt = toNum($('#s_zt').value);
+    const s = $('#s_start').value, en = $('#s_end').value;
+    if (!(wt > 0 && zt > 0)) { toast('الهدف يجب أن يكون أكبر من صفر'); return; }
+    if (!s || !en || en < s) { toast('راجع التواريخ: آخر يوم قبل أول يوم'); return; }
+    run(e.target.querySelector('button'), () => updateDoc(mainRef, {
+      'goals.water.target': Math.round(wt),
+      'goals.zakat.target': Math.round(zt),
+      start: s, end: en,
+      unit: $('#s_unit').value.trim() || 'جنيه',
+      howTo: $('#s_how').value.trim().slice(0, 400)
+    }), 'تم حفظ الإعدادات');
+  });
+
+  $('#fixForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const wr = toNum($('#f_w').value), zr = toNum($('#f_z').value);
+    if (isNaN(wr) || isNaN(zr) || wr < 0 || zr < 0) { toast('راجع الأرقام'); return; }
+    if (!confirm('تأكيد تصحيح المجموع يدويًا؟')) return;
+    run(e.target.querySelector('button'), () => updateDoc(mainRef, {
+      'goals.water.raised': Math.round(wr),
+      'goals.zakat.raised': Math.round(zr)
+    }), 'تم تصحيح المجموع');
+  });
+}
+
+/* ---------- العرض الحي ---------- */
+function renderTotals() {
+  const u = esc(state.unit);
+  const row = (k) => {
+    const g = state.goals[k];
+    return '<div class="tot"><span>' + esc(g.name) + '</span><span><strong>' + nf(g.raised) + '</strong> <span class="note">من ' + nf(g.target) + ' ' + u + '</span></span></div>';
+  };
+  $('#totals').innerHTML = '<div class="card-head"><h2>المجموع الحالي</h2></div>' + row('water') + row('zakat');
+}
+
+function renderRecent() {
+  const box = $('#recent');
+  if (!recent.length) { box.innerHTML = '<p class="empty">لا توجد تبرعات بعد.</p>'; return; }
+  box.innerHTML = '<ul class="log">' + recent.map((r) => {
+    const g = state.goals[r.g] || { name: '' };
+    const dt = r.t && r.t.toDate ? r.t.toDate() : new Date();
+    const when = dt.toLocaleString(LOC, { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+    return '<li class="' + esc(r.g) + '"><span class="dot"></span><div class="body">' +
+      '<div class="row1"><span class="amt">' + nf(r.amt) + ' ' + esc(state.unit) + '</span><span class="tag">' + esc(g.name) + '</span></div>' +
+      '<div class="row2">' + esc(r.who || 'فاعل خير') + ' · ' + when + (r.by ? ' · ' + esc(r.by) : '') + '</div></div>' +
+      '<button class="btn alt mini danger" type="button" data-del="' + esc(r.id) + '">حذف</button></li>';
+  }).join('') + '</ul>';
+  box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => {
+    const r = recent.find((x) => x.id === b.dataset.del);
+    if (!r) return;
+    if (!confirm('حذف تبرع ' + nf(r.amt) + ' ' + state.unit + '؟')) return;
+    run(b, async () => {
+      const batch = writeBatch(db);
+      batch.delete(doc(db, 'donations', r.id));
+      batch.update(mainRef, { ['goals.' + r.g + '.raised']: increment(-r.amt) });
+      await batch.commit();
+    }, 'تم الحذف');
+  }));
+}
+
+function renderLive() {
+  if (!state) { $('#setup').hidden = false; $('#main').hidden = true; return; }
+  $('#setup').hidden = true; $('#main').hidden = false;
+  if (!built) { buildForms(); built = true; }
+  renderTotals();
+  renderRecent();
+}
+
+async function exportCsv() {
+  const snap = await getDocs(query(collection(db, 'donations'), orderBy('t', 'asc')));
+  if (snap.empty) { toast('لا توجد تبرعات للتصدير بعد'); return; }
+  const p = (n) => String(n).padStart(2, '0');
+  const q = (v) => typeof v === 'number' ? v : '"' + String(v).replace(/"/g, '""') + '"';
+  const rows = [['التاريخ', 'الوقت', 'المبلغ', 'الجهة', 'المتبرع', 'سجّله']];
+  snap.docs.forEach((d) => {
+    const r = d.data(), t = r.t && r.t.toDate ? r.t.toDate() : new Date(), g = state.goals[r.g] || { name: r.g };
+    rows.push([t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()), p(t.getHours()) + ':' + p(t.getMinutes()), r.amt, g.name, r.who || 'فاعل خير', r.by || '']);
+  });
+  const csv = '\ufeff' + rows.map((r) => r.map(q).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const n = new Date();
+  a.download = 'madad-donations-' + n.getFullYear() + '-' + p(n.getMonth() + 1) + '-' + p(n.getDate()) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('تم تنزيل الملف');
+}
+
+/* ---------- ربط الدخول بالبيانات ---------- */
+onAuthStateChanged(auth, (u) => {
+  user = u;
+  unsubs.forEach((f) => f()); unsubs = [];
+  built = false; state = null; recent = [];
+  if (!u) { renderLogin(); return; }
+  renderShell();
+
+  const denied = () => { toast('هذا الحساب غير مصرّح له.'); signOut(auth); };
+  unsubs.push(onSnapshot(mainRef, (snap) => {
+    state = snap.exists() ? snap.data() : null;
+    renderLive();
+  }, denied));
+  unsubs.push(onSnapshot(query(collection(db, 'donations'), orderBy('t', 'desc'), limit(20)), (snap) => {
+    recent = snap.docs.map((d) => ({ id: d.id, ...d.data({ serverTimestamps: 'estimate' }) }));
+    if (state) renderRecent();
+  }, denied));
+});
+</script>
+</body>
+</html>
